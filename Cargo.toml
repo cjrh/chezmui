@@ -1,0 +1,19 @@
+[package]
+name = "chezmui"
+version = "0.1.0"
+edition = "2024"
+# A personal GUI binary, never published to crates.io.
+publish = false
+
+[dependencies]
+# CPU (tiny-skia) renderer is deliberate: it avoids GPU context loss across
+# suspend/resume on Linux, matching the setup used in the sibling iced apps.
+iced = { version = "0.14", default-features = false, features = [
+    "tiny-skia",
+    "thread-pool",
+    "web-colors",
+    "x11",
+    "wayland",
+] }
+iced-themer = { path = "../iced-themer" }
+rfd = "0.17"

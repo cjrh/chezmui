@@ -1,0 +1,34 @@
+# chezmui theme — consumed by the `iced-themer` crate.
+#
+# This file is embedded into the binary at compile time (see main.rs), so the
+# app is themed no matter which directory it is launched from. The [palette]
+# drives iced's overall Theme (window background, scrollbars, default widget
+# colours, and the colours read back via Theme::palette() for diff syntax
+# highlighting). [container] styles the two raised panels.
+
+name = "chezmui Dark"
+
+# Define colours once; reference them with $name. Derived shades use the
+# transformation functions iced-themer provides (lighten / darken / desaturate).
+[variables]
+bg        = "#191b26"   # window background
+bg-raised = "#22252f"   # the two panels sit on top of the window
+text      = "#cdd3e0"
+primary   = "#7aa2f7"   # blue — neutral actions, "modified", diff hunk headers
+success   = "#9ece6a"   # green — apply direction, "added", diff additions
+warning   = "#e0af68"
+danger    = "#f7768e"   # red — forget, "deleted", diff removals
+
+[palette]
+background = "$bg"
+text       = "$text"
+primary    = "$primary"
+success    = "$success"
+warning    = "$warning"
+danger     = "$danger"
+
+[container]
+background    = "$bg-raised"
+border-radius = 10.0
+border-width  = 1.0
+border-color  = "#ffffff12"
