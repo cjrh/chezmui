@@ -16,8 +16,6 @@
 //! The left pane lists every differing file; selecting one shows its diff and
 //! the per-file actions on the right.
 
-#![windows_subsystem = "windows"]
-
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -35,6 +33,14 @@ use chezmoi::{Change, Entry};
 /// The theme is baked into the binary so the app is styled regardless of the
 /// directory it is launched from.
 const THEME_TOML: &str = include_str!("../theme.toml");
+
+/// Font sizes kept in one place so the whole UI scales together. These sit
+/// above iced's defaults for comfortable reading; adjust here to re-scale.
+const SIZE_TITLE: f32 = 30.0;
+const SIZE_HEADING: f32 = 18.0;
+const SIZE_BODY: f32 = 16.0;
+const SIZE_SMALL: f32 = 14.0;
+const SIZE_CAPTION: f32 = 13.0;
 
 fn main() -> iced::Result {
     let config = Arc::new(
@@ -63,6 +69,13 @@ fn window_settings() -> window::Settings {
     window::Settings {
         size: Size::new(980.0, 660.0),
         min_size: Some(Size::new(680.0, 440.0)),
+        // Give the toplevel a stable Wayland app_id so the compositor and dock
+        // identify the window (icon, name) and can parent the file-chooser
+        // portal dialog to it instead of listing it as a stray window.
+        platform_specific: window::settings::PlatformSpecific {
+            application_id: "chezmui".to_string(),
+            ..Default::default()
+        },
         ..window::Settings::default()
     }
 }
@@ -321,16 +334,16 @@ fn view(state: &State) -> Element<'_, Msg> {
 /// Title plus the global actions that apply to everything at once.
 fn header<'a>(state: &State, palette: &Palette) -> Element<'a, Msg> {
     let titles = column![
-        text("chezmui").size(24).color(palette.text),
+        text("chezmui").size(SIZE_TITLE).color(palette.text),
         text("chezmoi, without the typing")
-            .size(12)
+            .size(SIZE_SMALL)
             .color(dim(palette.text, 0.5)),
     ]
     .spacing(2)
     .width(Length::Fill);
 
     let working = if state.busy {
-        text("working…").size(12).color(palette.primary)
+        text("working…").size(SIZE_SMALL).color(palette.primary)
     } else {
         text("")
     };
@@ -361,7 +374,7 @@ fn banner_view<'a>(banner: &Banner, palette: &Palette) -> Element<'a, Msg> {
         Level::Success => palette.success,
         Level::Error => palette.danger,
     };
-    container(text(banner.message.clone()).size(12).color(palette.text))
+    container(text(banner.message.clone()).size(SIZE_SMALL).color(palette.text))
         .padding([8, 12])
         .width(Length::Fill)
         .style(move |_theme: &Theme| container::Style {
@@ -382,10 +395,10 @@ fn entry_list<'a>(state: &'a State, palette: &Palette) -> Element<'a, Msg> {
         container(
             column![
                 text("✓ Everything is in sync")
-                    .size(15)
+                    .size(SIZE_HEADING)
                     .color(palette.success),
                 text("No managed files differ from your home directory.")
-                    .size(12)
+                    .size(SIZE_SMALL)
                     .color(dim(palette.text, 0.5)),
             ]
             .spacing(6),
@@ -411,7 +424,7 @@ fn entry_list<'a>(state: &'a State, palette: &Palette) -> Element<'a, Msg> {
     };
 
     let heading = text(format!("Changes ({})", state.entries.len()))
-        .size(13)
+        .size(SIZE_BODY)
         .color(dim(palette.text, 0.6));
 
     container(column![heading, inner].spacing(10).height(Length::Fill))
@@ -431,9 +444,9 @@ fn entry_row<'a>(entry: &Entry, index: usize, selected: bool, palette: &Palette)
     );
     let badge = text(code)
         .font(Font::MONOSPACE)
-        .size(13)
+        .size(SIZE_BODY)
         .color(change_color(primary_change(entry), palette));
-    let path = text(entry.display.clone()).size(13).color(palette.text);
+    let path = text(entry.display.clone()).size(SIZE_BODY).color(palette.text);
 
     let content = row![badge, path]
         .spacing(12)
@@ -479,7 +492,7 @@ fn detail_pane<'a>(state: &'a State, palette: &Palette) -> Element<'a, Msg> {
     let inner: Element<Msg> = match state.selected {
         None => container(
             text("Select a file on the left to see what changed.")
-                .size(13)
+                .size(SIZE_BODY)
                 .color(dim(palette.text, 0.5)),
         )
         .center_x(Length::Fill)
@@ -491,9 +504,9 @@ fn detail_pane<'a>(state: &'a State, palette: &Palette) -> Element<'a, Msg> {
 
             let change = primary_change(entry);
             let title = row![
-                text(entry.display.clone()).size(15).color(palette.text),
+                text(entry.display.clone()).size(SIZE_HEADING).color(palette.text),
                 text(change.label())
-                    .size(11)
+                    .size(SIZE_SMALL)
                     .color(change_color(change, palette)),
             ]
             .spacing(10)
@@ -550,7 +563,7 @@ fn labeled_action<'a>(
     column![
         action_button(label, accent, on_press),
         text(caption.to_string())
-            .size(10)
+            .size(SIZE_CAPTION)
             .color(dim(palette.text, 0.5)),
     ]
     .spacing(4)
@@ -563,12 +576,12 @@ fn diff_view<'a>(diff: &DiffState, palette: &Palette) -> Element<'a, Msg> {
     let content: Element<Msg> = match diff {
         DiffState::Empty => text("").into(),
         DiffState::Loading => text("Loading diff…")
-            .size(12)
+            .size(SIZE_SMALL)
             .color(dim(palette.text, 0.6))
             .into(),
-        DiffState::Error(e) => text(e.clone()).size(12).color(palette.danger).into(),
+        DiffState::Error(e) => text(e.clone()).size(SIZE_SMALL).color(palette.danger).into(),
         DiffState::Loaded(d) if d.trim().is_empty() => text("No differences to show.")
-            .size(12)
+            .size(SIZE_SMALL)
             .color(dim(palette.text, 0.6))
             .into(),
         DiffState::Loaded(d) => {
@@ -577,7 +590,7 @@ fn diff_view<'a>(diff: &DiffState, palette: &Palette) -> Element<'a, Msg> {
                 .map(|line| {
                     text(line.to_string())
                         .font(Font::MONOSPACE)
-                        .size(12)
+                        .size(SIZE_SMALL)
                         .color(diff_line_color(line, palette))
                         .into()
                 })
@@ -617,7 +630,7 @@ fn diff_view<'a>(diff: &DiffState, palette: &Palette) -> Element<'a, Msg> {
 /// disabled (iced treats a missing handler as non-interactive), which is how we
 /// grey out actions while an operation is running.
 fn action_button<'a>(label: &str, accent: Color, on_press: Option<Msg>) -> Element<'a, Msg> {
-    let mut b = button(text(label.to_string()).size(13))
+    let mut b = button(text(label.to_string()).size(SIZE_BODY))
         .padding([8, 14])
         .style(move |_theme, status| {
             let background = match status {
