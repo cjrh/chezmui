@@ -2,6 +2,7 @@
 name = "chezmui"
 version = "0.1.0"
 edition = "2024"
+description = "GUI front-end for the chezmoi dotfile manager: shows diffs and lets you apply or re-add changes with one click"
 # A personal GUI binary, never published to crates.io.
 publish = false
 
