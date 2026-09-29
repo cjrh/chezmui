@@ -14,21 +14,25 @@
 //! * **← Re-add** pull your local edits back into chezmoi's source.
 //!
 //! The left pane lists every differing file; selecting one shows its diff and
-//! the per-file actions on the right.
+//! the per-file actions on the right. A separate dialog commits and pushes
+//! selected files in the chezmoi source repository.
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use iced::widget::{Column, button, column, container, row, scrollable, text};
+use iced::widget::{
+    Column, button, checkbox, column, container, row, scrollable, text, text_input,
+};
 use iced::{
-    Alignment, Border, Color, Element, Font, Length, Size, Task, Theme, color, theme::Palette,
-    window,
+    Alignment, Border, Color, Element, Font, Length, Size, Subscription, Task, Theme, color,
+    theme::Palette, window,
 };
 use iced_themer::{ThemeConfig, Themed};
 
 mod chezmoi;
-use chezmoi::{Change, Entry};
+use chezmoi::{Change, Entry, GitEntry, GitStatus};
 
 /// The theme is baked into the binary so the app is styled regardless of the
 /// directory it is launched from.
@@ -53,10 +57,21 @@ fn main() -> iced::Result {
     let boot_cfg = Arc::clone(&config);
     let theme_cfg = Arc::clone(&config);
 
-    let app = iced::application(move || boot(Arc::clone(&boot_cfg)), update, view)
-        .title("chezmui")
-        .theme(move |_state: &State| theme_cfg.theme())
-        .window(window_settings());
+    let app = iced::daemon(move || boot(Arc::clone(&boot_cfg)), update, view)
+        .title(|state: &State, id| {
+            if state.git_window == Some(id) {
+                "Commit chezmoi changes".into()
+            } else {
+                "chezmui".into()
+            }
+        })
+        .theme(move |_state: &State, _id| theme_cfg.theme())
+        .subscription(|_state| {
+            Subscription::batch([
+                window::close_events().map(Msg::WindowClosed),
+                window::close_requests().map(Msg::WindowCloseRequested),
+            ])
+        });
 
     // iced-themer reports a configured font (or None to keep iced's default).
     match font {
@@ -80,11 +95,28 @@ fn window_settings() -> window::Settings {
     }
 }
 
+fn git_window_settings() -> window::Settings {
+    window::Settings {
+        size: Size::new(1100.0, 740.0),
+        min_size: Some(Size::new(740.0, 480.0)),
+        position: window::Position::Centered,
+        // Closing is handled in update so work cannot be interrupted midway.
+        exit_on_close_request: false,
+        platform_specific: window::settings::PlatformSpecific {
+            application_id: "chezmui".to_string(),
+            ..Default::default()
+        },
+        ..window::Settings::default()
+    }
+}
+
 // ── State ────────────────────────────────────────────────────────────
 
 struct State {
     /// The loaded theme, kept so `view` can read the palette and style panels.
     theme: Arc<ThemeConfig>,
+    main_window: window::Id,
+    git_window: Option<window::Id>,
     /// Every managed path that currently differs (from `chezmoi status`).
     entries: Vec<Entry>,
     /// Index into `entries` of the file whose diff is shown, if any.
@@ -93,9 +125,21 @@ struct State {
     diff: DiffState,
     /// The most recent operation result, shown as a coloured banner.
     banner: Option<Banner>,
-    /// True while a chezmoi command is running; disables the action buttons so
-    /// the user can't fire overlapping operations.
+    /// True while a command or file picker is running; disables actions so
+    /// the user cannot start overlapping operations.
     busy: bool,
+    /// State of the separate Git window, if open.
+    git_dialog: Option<GitDialog>,
+}
+
+struct GitDialog {
+    source: Option<PathBuf>,
+    entries: Vec<GitEntry>,
+    selected: HashSet<PathBuf>,
+    message: String,
+    feedback: Option<Banner>,
+    preview: DiffState,
+    preview_version: u64,
 }
 
 impl State {
@@ -150,23 +194,68 @@ enum Msg {
     FilesPicked(Vec<PathBuf>),
     /// A long-running operation finished. The label names it for the banner.
     OpDone(&'static str, Result<String, String>),
+    OpenGit,
+    CloseGit,
+    GitLoaded(Result<GitStatus, String>),
+    ToggleGit(PathBuf, bool),
+    GitMessageChanged(String),
+    RefreshGitPreview,
+    GitPreviewLoaded(window::Id, u64, Result<String, String>),
+    CommitGit,
+    PushAndClose,
+    GitDone(GitAction, Result<String, String>),
+    WindowCloseRequested(window::Id),
+    WindowClosed(window::Id),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum GitAction {
+    Commit,
+    PushAndClose,
 }
 
 fn boot(theme: Arc<ThemeConfig>) -> (State, Task<Msg>) {
+    let (main_window, open) = window::open(window_settings());
     let state = State {
         theme,
+        main_window,
+        git_window: None,
         entries: Vec::new(),
         selected: None,
         diff: DiffState::Empty,
         banner: None,
         busy: true,
+        git_dialog: None,
     };
-    (state, Task::perform(async { chezmoi::status() }, Msg::StatusLoaded))
+    (
+        state,
+        Task::batch([
+            open.discard(),
+            Task::perform(async { chezmoi::status() }, Msg::StatusLoaded),
+        ]),
+    )
 }
 
 // ── Update ───────────────────────────────────────────────────────────
 
 fn update(state: &mut State, msg: Msg) -> Task<Msg> {
+    // The main window stays visible behind Git, but its controls are inactive.
+    if state.git_window.is_some()
+        && matches!(
+            msg,
+            Msg::Refresh
+                | Msg::Select(_)
+                | Msg::ApplyAll
+                | Msg::ApplyOne
+                | Msg::ReAddOne
+                | Msg::ForgetOne
+                | Msg::Update
+                | Msg::PickFiles
+                | Msg::FilesPicked(_)
+        )
+    {
+        return Task::none();
+    }
     match msg {
         Msg::Refresh => {
             state.busy = true;
@@ -248,9 +337,13 @@ fn update(state: &mut State, msg: Msg) -> Task<Msg> {
         },
         Msg::Update => start_op(state, "Update", async { chezmoi::update() }),
 
-        Msg::PickFiles => Task::perform(pick_files(), Msg::FilesPicked),
+        Msg::PickFiles => {
+            state.busy = true;
+            Task::perform(pick_files(), Msg::FilesPicked)
+        }
         Msg::FilesPicked(paths) => {
             if paths.is_empty() {
+                state.busy = false;
                 return Task::none();
             }
             start_op(state, "Add", async move {
@@ -259,7 +352,7 @@ fn update(state: &mut State, msg: Msg) -> Task<Msg> {
         }
 
         Msg::OpDone(label, result) => {
-            state.busy = false;
+            state.busy = true;
             state.banner = Some(match result {
                 Ok(msg) => Banner {
                     level: Level::Success,
@@ -277,6 +370,214 @@ fn update(state: &mut State, msg: Msg) -> Task<Msg> {
             // Any operation changes the on-disk state, so refresh the list.
             Task::perform(async { chezmoi::status() }, Msg::StatusLoaded)
         }
+
+        Msg::OpenGit if !state.busy && state.git_window.is_none() => {
+            let (id, open) = window::open(git_window_settings());
+            state.git_window = Some(id);
+            state.busy = true;
+            state.git_dialog = Some(GitDialog {
+                source: None,
+                entries: Vec::new(),
+                selected: HashSet::new(),
+                message: String::new(),
+                feedback: None,
+                preview: DiffState::Empty,
+                preview_version: 0,
+            });
+            Task::batch([
+                open.then(window::gain_focus),
+                Task::perform(async { chezmoi::git_status() }, Msg::GitLoaded),
+            ])
+        }
+        Msg::CloseGit if !state.busy => close_git(state),
+        Msg::WindowCloseRequested(id) if state.git_window == Some(id) && !state.busy => {
+            close_git(state)
+        }
+        Msg::WindowClosed(id) if id == state.main_window => iced::exit(),
+        Msg::WindowClosed(id) if state.git_window == Some(id) => {
+            state.git_window = None;
+            state.git_dialog = None;
+            // A compositor can close a window even while Git is working. Keep
+            // busy until that task finishes, then report its result in main.
+            Task::none()
+        }
+        Msg::GitLoaded(result) => {
+            state.busy = false;
+            if let Some(dialog) = &mut state.git_dialog {
+                match result {
+                    Ok(status) => {
+                        dialog.source = Some(status.source);
+                        dialog.entries = status.entries;
+                        dialog
+                            .selected
+                            .retain(|path| dialog.entries.iter().any(|e| &e.path == path));
+                    }
+                    Err(e) => {
+                        dialog.source = None;
+                        dialog.entries.clear();
+                        dialog.selected.clear();
+                        dialog.preview = DiffState::Empty;
+                        dialog.feedback = Some(Banner {
+                            level: Level::Error,
+                            message: format!("Couldn't read Git changes: {e}"),
+                        });
+                    }
+                }
+                if !dialog.selected.is_empty() {
+                    return load_git_preview(state.git_window.unwrap(), dialog);
+                }
+            }
+            Task::none()
+        }
+        Msg::ToggleGit(path, checked) if !state.busy => {
+            let Some(dialog) = &mut state.git_dialog else {
+                return Task::none();
+            };
+            if !dialog.entries.iter().any(|e| e.path == path) {
+                return Task::none();
+            }
+            if checked {
+                dialog.selected.insert(path);
+            } else {
+                dialog.selected.remove(&path);
+            }
+            load_git_preview(state.git_window.unwrap(), dialog)
+        }
+        Msg::RefreshGitPreview if !state.busy => match (state.git_window, &mut state.git_dialog) {
+            (Some(id), Some(dialog)) => load_git_preview(id, dialog),
+            _ => Task::none(),
+        },
+        Msg::GitPreviewLoaded(id, version, result) => {
+            if state.git_window == Some(id)
+                && let Some(dialog) = &mut state.git_dialog
+                && dialog.preview_version == version
+            {
+                dialog.preview = match result {
+                    Ok(diff) => DiffState::Loaded(diff),
+                    Err(e) => DiffState::Error(e),
+                };
+            }
+            Task::none()
+        }
+        Msg::GitMessageChanged(message) if !state.busy => {
+            if let Some(dialog) = &mut state.git_dialog {
+                dialog.message = message;
+            }
+            Task::none()
+        }
+        Msg::CommitGit if !state.busy => {
+            let Some(dialog) = &mut state.git_dialog else {
+                return Task::none();
+            };
+            if dialog.selected.is_empty()
+                || dialog.message.trim().is_empty()
+                || !matches!(&dialog.preview, DiffState::Loaded(diff) if !diff.trim().is_empty())
+                || dialog.source.is_none()
+            {
+                return Task::none();
+            }
+            let paths: Vec<_> = dialog.selected.iter().cloned().collect();
+            let message = dialog.message.clone();
+            dialog.preview_version += 1;
+            dialog.feedback = None;
+            state.busy = true;
+            Task::perform(
+                async move { chezmoi::commit_git(&paths, &message) },
+                |result| Msg::GitDone(GitAction::Commit, result),
+            )
+        }
+        Msg::PushAndClose if !state.busy => {
+            let Some(dialog) = &mut state.git_dialog else {
+                return Task::none();
+            };
+            if dialog.source.is_none() || !dialog.selected.is_empty() {
+                return Task::none();
+            }
+            state.busy = true;
+            dialog.feedback = None;
+            Task::perform(async { chezmoi::push_git() }, |result| {
+                Msg::GitDone(GitAction::PushAndClose, result)
+            })
+        }
+        Msg::GitDone(GitAction::Commit, result) => {
+            if let Some(dialog) = &mut state.git_dialog {
+                if result.is_ok() {
+                    dialog.message.clear();
+                    dialog.selected.clear();
+                    dialog.preview = DiffState::Empty;
+                }
+                dialog.feedback = Some(git_feedback(result));
+                // Staging may have changed the index even if the commit failed.
+                Task::perform(async { chezmoi::git_status() }, Msg::GitLoaded)
+            } else {
+                state.busy = false;
+                state.banner = Some(git_feedback(result));
+                Task::none()
+            }
+        }
+        Msg::GitDone(GitAction::PushAndClose, result) => {
+            state.busy = false;
+            match result {
+                Ok(message) => {
+                    state.banner = Some(Banner {
+                        level: Level::Success,
+                        message,
+                    });
+                    close_git(state)
+                }
+                Err(e) => {
+                    if let Some(dialog) = &mut state.git_dialog {
+                        dialog.feedback = Some(Banner {
+                            level: Level::Error,
+                            message: e,
+                        });
+                    } else {
+                        state.banner = Some(Banner {
+                            level: Level::Error,
+                            message: e,
+                        });
+                    }
+                    Task::none()
+                }
+            }
+        }
+        _ => Task::none(),
+    }
+}
+
+fn close_git(state: &mut State) -> Task<Msg> {
+    let Some(id) = state.git_window.take() else {
+        return Task::none();
+    };
+    state.git_dialog = None;
+    state.busy = false;
+    window::close(id)
+}
+
+fn load_git_preview(id: window::Id, dialog: &mut GitDialog) -> Task<Msg> {
+    dialog.preview_version += 1;
+    if dialog.selected.is_empty() {
+        dialog.preview = DiffState::Empty;
+        return Task::none();
+    }
+    let version = dialog.preview_version;
+    let paths: Vec<_> = dialog.selected.iter().cloned().collect();
+    dialog.preview = DiffState::Loading;
+    Task::perform(async move { chezmoi::git_preview(&paths) }, move |result| {
+        Msg::GitPreviewLoaded(id, version, result)
+    })
+}
+
+fn git_feedback(result: Result<String, String>) -> Banner {
+    match result {
+        Ok(message) => Banner {
+            level: Level::Success,
+            message,
+        },
+        Err(message) => Banner {
+            level: Level::Error,
+            message,
+        },
     }
 }
 
@@ -304,15 +605,24 @@ async fn pick_files() -> Vec<PathBuf> {
         .pick_files()
         .await
     {
-        Some(handles) => handles.into_iter().map(|h| h.path().to_path_buf()).collect(),
+        Some(handles) => handles
+            .into_iter()
+            .map(|h| h.path().to_path_buf())
+            .collect(),
         None => Vec::new(),
     }
 }
 
 // ── View ─────────────────────────────────────────────────────────────
 
-fn view(state: &State) -> Element<'_, Msg> {
+fn view(state: &State, id: window::Id) -> Element<'_, Msg> {
     let palette = state.theme.theme().palette();
+    if state.git_window == Some(id) {
+        return state.git_dialog.as_ref().map_or_else(
+            || text("").into(),
+            |dialog| git_dialog_view(state, dialog, &palette),
+        );
+    }
 
     let body = row![entry_list(state, &palette), detail_pane(state, &palette)]
         .spacing(16)
@@ -333,38 +643,224 @@ fn view(state: &State) -> Element<'_, Msg> {
 
 /// Title plus the global actions that apply to everything at once.
 fn header<'a>(state: &State, palette: &Palette) -> Element<'a, Msg> {
-    let titles = column![
-        text("chezmui").size(SIZE_TITLE).color(palette.text),
-        text("chezmoi, without the typing")
-            .size(SIZE_SMALL)
-            .color(dim(palette.text, 0.5)),
-    ]
-    .spacing(2)
-    .width(Length::Fill);
-
     let working = if state.busy {
         text("working…").size(SIZE_SMALL).color(palette.primary)
     } else {
         text("")
     };
+    let titles = column![
+        text("chezmui").size(SIZE_TITLE).color(palette.text),
+        text("chezmoi, without the typing")
+            .size(SIZE_SMALL)
+            .color(dim(palette.text, 0.5)),
+        working,
+    ]
+    .spacing(2)
+    .width(Length::Fill);
 
-    let idle = !state.busy;
-    let buttons = row![
+    let idle = !state.busy && state.git_window.is_none();
+    let remote_actions = column![
+        text("REMOTE / GIT")
+            .size(SIZE_CAPTION)
+            .color(dim(palette.warning, 0.8)),
+        row![
+            action_button(
+                "Update (pull)",
+                palette.warning,
+                idle.then_some(Msg::Update)
+            ),
+            action_button(
+                "Commit & push…",
+                palette.warning,
+                idle.then_some(Msg::OpenGit)
+            ),
+        ]
+        .spacing(10),
+    ]
+    .spacing(5);
+    let local_actions = row![
         action_button("Refresh", palette.primary, idle.then_some(Msg::Refresh)),
         action_button(
             "Apply all →",
             palette.success,
             (idle && !state.entries.is_empty()).then_some(Msg::ApplyAll),
         ),
-        action_button("Update (pull)", palette.primary, idle.then_some(Msg::Update)),
-        action_button("Add files…", palette.primary, idle.then_some(Msg::PickFiles)),
+        action_button(
+            "Add files…",
+            palette.primary,
+            idle.then_some(Msg::PickFiles)
+        ),
+    ]
+    .spacing(10);
+
+    column![
+        row![titles, remote_actions]
+            .spacing(16)
+            .align_y(Alignment::Center),
+        local_actions,
     ]
     .spacing(10)
+    .into()
+}
+
+/// The separate Git window keeps the changed paths and their selected diff
+/// visible while writing a commit message.
+fn git_dialog_view<'a>(
+    state: &'a State,
+    dialog: &'a GitDialog,
+    palette: &Palette,
+) -> Element<'a, Msg> {
+    let busy = state.busy;
+    let heading = row![
+        text("Commit chezmoi changes")
+            .size(SIZE_HEADING)
+            .color(palette.text)
+            .width(Length::Fill),
+        text(if busy { "Working…" } else { "" })
+            .size(SIZE_SMALL)
+            .color(palette.warning),
+        action_button("Close", palette.primary, (!busy).then_some(Msg::CloseGit)),
+    ]
     .align_y(Alignment::Center);
 
-    row![titles, working, buttons]
-        .spacing(16)
-        .align_y(Alignment::Center)
+    let source = dialog.source.as_ref().map_or_else(
+        || "Finding chezmoi's Git repo…".into(),
+        |path| format!("Repository: {}", path.display()),
+    );
+    let mut content = column![
+        heading,
+        text(source).size(SIZE_SMALL).color(dim(palette.text, 0.6)),
+        text("Select the files to commit. Other staged files will not be committed.")
+            .size(SIZE_SMALL)
+            .color(dim(palette.text, 0.6)),
+    ]
+    .spacing(12);
+
+    if let Some(feedback) = &dialog.feedback {
+        content = content.push(banner_view(feedback, palette));
+    }
+
+    let files: Element<Msg> = if dialog.source.is_none() {
+        text(if busy {
+            "Loading Git changes…"
+        } else {
+            "Git changes unavailable."
+        })
+        .size(SIZE_BODY)
+        .into()
+    } else if dialog.entries.is_empty() {
+        text("No changed files in the chezmoi Git repo.")
+            .size(SIZE_BODY)
+            .color(dim(palette.text, 0.6))
+            .into()
+    } else {
+        let items: Vec<Element<Msg>> = dialog
+            .entries
+            .iter()
+            .map(|entry| {
+                let path = entry.path.clone();
+                let selected = dialog.selected.contains(&path);
+                let label = format!("{}  {}", entry.status, entry.display);
+                checkbox(selected)
+                    .label(label)
+                    .size(20)
+                    .text_size(SIZE_BODY)
+                    .on_toggle(move |checked| Msg::ToggleGit(path.clone(), checked))
+                    .into()
+            })
+            .collect();
+        scrollable(Column::with_children(items).spacing(8).padding(8))
+            .height(Length::Fill)
+            .into()
+    };
+
+    let list = column![
+        text(format!("Changed files ({})", dialog.entries.len()))
+            .size(SIZE_BODY)
+            .color(palette.text),
+        inset_panel(files),
+    ]
+    .spacing(8)
+    .width(Length::FillPortion(2))
+    .height(Length::Fill);
+
+    let preview_content: Element<Msg> = if dialog.selected.is_empty() {
+        text("Select files to preview the commit.")
+            .size(SIZE_SMALL)
+            .color(dim(palette.text, 0.6))
+            .into()
+    } else {
+        diff_view(&dialog.preview, palette)
+    };
+    let preview = column![
+        row![
+            text("Selected changes")
+                .size(SIZE_BODY)
+                .color(palette.text)
+                .width(Length::Fill),
+            action_button(
+                "Refresh diff",
+                palette.primary,
+                (!busy && !dialog.selected.is_empty()).then_some(Msg::RefreshGitPreview),
+            ),
+        ]
+        .align_y(Alignment::Center),
+        inset_panel(preview_content),
+    ]
+    .spacing(8)
+    .width(Length::FillPortion(3))
+    .height(Length::Fill);
+    content = content.push(row![list, preview].spacing(14).height(Length::Fill));
+
+    let can_commit = !busy
+        && dialog.source.is_some()
+        && !dialog.selected.is_empty()
+        && !dialog.message.trim().is_empty()
+        && matches!(&dialog.preview, DiffState::Loaded(diff) if !diff.trim().is_empty());
+    content = content
+        .push(text(format!("Selected: {} · Push & Close sends commits only; it does not commit selected files.", dialog.selected.len())).size(SIZE_SMALL))
+        .push(text_input("Commit message", &dialog.message)
+            .on_input(Msg::GitMessageChanged)
+            .on_submit(Msg::CommitGit)
+            .size(SIZE_BODY)
+            .padding(10))
+        .push(row![
+            action_button("Commit", palette.warning, can_commit.then_some(Msg::CommitGit)),
+            action_button("Push & Close", palette.warning,
+                (!busy && dialog.source.is_some() && dialog.selected.is_empty())
+                    .then_some(Msg::PushAndClose)),
+        ].spacing(10));
+
+    container(content)
+        .padding(18)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .themed(state.theme.container())
+        .into()
+}
+
+/// Dark well used for the Git file list and the preview.
+fn inset_panel<'a>(content: impl Into<Element<'a, Msg>>) -> Element<'a, Msg> {
+    container(content)
+        .padding(10)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(|_theme: &Theme| container::Style {
+            background: Some(
+                Color {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                    a: 0.18,
+                }
+                .into(),
+            ),
+            border: Border {
+                radius: 8.0.into(),
+                ..Border::default()
+            },
+            ..container::Style::default()
+        })
         .into()
 }
 
@@ -374,19 +870,23 @@ fn banner_view<'a>(banner: &Banner, palette: &Palette) -> Element<'a, Msg> {
         Level::Success => palette.success,
         Level::Error => palette.danger,
     };
-    container(text(banner.message.clone()).size(SIZE_SMALL).color(palette.text))
-        .padding([8, 12])
-        .width(Length::Fill)
-        .style(move |_theme: &Theme| container::Style {
-            background: Some(dim(accent, 0.15).into()),
-            border: Border {
-                radius: 8.0.into(),
-                width: 1.0,
-                color: dim(accent, 0.4),
-            },
-            ..container::Style::default()
-        })
-        .into()
+    container(
+        text(banner.message.clone())
+            .size(SIZE_SMALL)
+            .color(palette.text),
+    )
+    .padding([8, 12])
+    .width(Length::Fill)
+    .style(move |_theme: &Theme| container::Style {
+        background: Some(dim(accent, 0.15).into()),
+        border: Border {
+            radius: 8.0.into(),
+            width: 1.0,
+            color: dim(accent, 0.4),
+        },
+        ..container::Style::default()
+    })
+    .into()
 }
 
 /// Left panel: a count and the scrollable list of differing files.
@@ -411,7 +911,15 @@ fn entry_list<'a>(state: &'a State, palette: &Palette) -> Element<'a, Msg> {
             .entries
             .iter()
             .enumerate()
-            .map(|(i, e)| entry_row(e, i, state.selected == Some(i), palette))
+            .map(|(i, e)| {
+                entry_row(
+                    e,
+                    i,
+                    state.selected == Some(i),
+                    state.git_window.is_none(),
+                    palette,
+                )
+            })
             .collect();
         scrollable(
             Column::with_children(rows)
@@ -436,7 +944,13 @@ fn entry_list<'a>(state: &'a State, palette: &Palette) -> Element<'a, Msg> {
 }
 
 /// One clickable file row: a two-character status badge and the path.
-fn entry_row<'a>(entry: &Entry, index: usize, selected: bool, palette: &Palette) -> Element<'a, Msg> {
+fn entry_row<'a>(
+    entry: &Entry,
+    index: usize,
+    selected: bool,
+    enabled: bool,
+    palette: &Palette,
+) -> Element<'a, Msg> {
     let code = format!(
         "{}{}",
         code_char(entry.last_to_actual),
@@ -446,7 +960,9 @@ fn entry_row<'a>(entry: &Entry, index: usize, selected: bool, palette: &Palette)
         .font(Font::MONOSPACE)
         .size(SIZE_BODY)
         .color(change_color(primary_change(entry), palette));
-    let path = text(entry.display.clone()).size(SIZE_BODY).color(palette.text);
+    let path = text(entry.display.clone())
+        .size(SIZE_BODY)
+        .color(palette.text);
 
     let content = row![badge, path]
         .spacing(12)
@@ -455,9 +971,11 @@ fn entry_row<'a>(entry: &Entry, index: usize, selected: bool, palette: &Palette)
 
     let primary = palette.primary;
     let text_color = palette.text;
-    button(content)
-        .on_press(Msg::Select(index))
-        .width(Length::Fill)
+    let mut row = button(content);
+    if enabled {
+        row = row.on_press(Msg::Select(index));
+    }
+    row.width(Length::Fill)
         .padding([7, 10])
         .style(move |_theme, status| {
             let background = if selected {
@@ -500,11 +1018,13 @@ fn detail_pane<'a>(state: &'a State, palette: &Palette) -> Element<'a, Msg> {
         .into(),
         Some(i) => {
             let entry = &state.entries[i];
-            let idle = !state.busy;
+            let idle = !state.busy && state.git_window.is_none();
 
             let change = primary_change(entry);
             let title = row![
-                text(entry.display.clone()).size(SIZE_HEADING).color(palette.text),
+                text(entry.display.clone())
+                    .size(SIZE_HEADING)
+                    .color(palette.text),
                 text(change.label())
                     .size(SIZE_SMALL)
                     .color(change_color(change, palette)),
@@ -579,7 +1099,10 @@ fn diff_view<'a>(diff: &DiffState, palette: &Palette) -> Element<'a, Msg> {
             .size(SIZE_SMALL)
             .color(dim(palette.text, 0.6))
             .into(),
-        DiffState::Error(e) => text(e.clone()).size(SIZE_SMALL).color(palette.danger).into(),
+        DiffState::Error(e) => text(e.clone())
+            .size(SIZE_SMALL)
+            .color(palette.danger)
+            .into(),
         DiffState::Loaded(d) if d.trim().is_empty() => text("No differences to show.")
             .size(SIZE_SMALL)
             .color(dim(palette.text, 0.6))

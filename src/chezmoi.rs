@@ -1,15 +1,12 @@
-//! Thin wrapper around the `chezmoi` command-line tool.
+//! Thin wrapper around the `chezmoi` and `git` command-line tools.
 //!
-//! The GUI never spawns `chezmoi` itself; every interaction goes through the
-//! handful of functions in this module. Each function maps to one day-to-day
-//! chezmoi operation, takes ordinary Rust values, and returns either parsed
-//! results or a human-readable error message. All the awkward parts — building
-//! argument lists, capturing stdout/stderr, suppressing the pager and colour
-//! codes, and turning a non-zero exit status into an error — live here and
-//! nowhere else.
+//! The GUI never spawns either tool itself; every interaction goes through the
+//! functions in this module. Each function takes ordinary Rust values and returns parsed
+//! results or a human-readable error message. Argument lists, stdout/stderr,
+//! and non-zero exit statuses are handled here, not in the UI.
 //!
-//! Every function blocks until `chezmoi` exits. Callers that must not block the
-//! UI thread (i.e. all of them) run these inside an `iced` `Task`.
+//! Every function blocks until its command exits. Callers run these inside an
+//! `iced` `Task` to keep the UI responsive.
 //!
 //! ## The two directions
 //!
@@ -24,8 +21,10 @@
 //! Keeping the names straight here means the rest of the app — and the user —
 //! can think in terms of "push managed version out" vs "pull my edits in".
 
+use std::ffi::OsString;
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 
 /// One axis of difference that chezmoi reports for a managed entry.
 ///
@@ -197,6 +196,211 @@ pub fn update() -> Result<String, String> {
     run(&["update", "--force"])
 }
 
+/// A change in the Git repository that holds chezmoi's source files.
+#[derive(Debug, Clone)]
+pub struct GitEntry {
+    /// A repository-relative path, suitable for `git add -- <path>`.
+    pub path: PathBuf,
+    pub display: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct GitStatus {
+    pub source: PathBuf,
+    pub entries: Vec<GitEntry>,
+}
+
+/// List changed, deleted, and untracked source files. Disable rename detection
+/// so every record in the NUL-delimited output has exactly one path.
+pub fn git_status() -> Result<GitStatus, String> {
+    let source = git_source()?;
+    let output = git(
+        &source,
+        &[
+            "-c",
+            "status.renames=false",
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+        ],
+    )?;
+    let entries = parse_git_status(&output);
+    Ok(GitStatus { source, entries })
+}
+
+fn parse_git_status(output: &[u8]) -> Vec<GitEntry> {
+    output
+        .split(|&byte| byte == 0)
+        .filter_map(|line| {
+            if line.len() < 4 || line[2] != b' ' {
+                return None;
+            }
+            let path = PathBuf::from(OsString::from_vec(line[3..].to_vec()));
+            Some(GitEntry {
+                display: String::from_utf8_lossy(&line[3..])
+                    .escape_debug()
+                    .to_string(),
+                path,
+                status: String::from_utf8_lossy(&line[..2]).into_owned(),
+            })
+        })
+        .collect()
+}
+
+/// Preview exactly the selected working-tree files without touching the real
+/// Git index. A temporary index starts at HEAD, then stages only these paths.
+/// This includes new files and staged changes, but excludes other staged files.
+pub fn git_preview(paths: &[PathBuf]) -> Result<String, String> {
+    let source = git_source()?;
+    preview_from(&source, paths)
+}
+
+fn preview_from(source: &Path, paths: &[PathBuf]) -> Result<String, String> {
+    if paths.is_empty() {
+        return Ok(String::new());
+    }
+    let temp = tempfile::tempdir().map_err(|e| format!("could not create preview index: {e}"))?;
+    let index = temp.path().join("index");
+    let mut read_tree = Command::new("git");
+    read_tree
+        .current_dir(source)
+        .env("GIT_INDEX_FILE", &index)
+        .arg("read-tree");
+    if git(source, &["rev-parse", "--verify", "HEAD"]).is_ok() {
+        read_tree.arg("HEAD");
+    } else {
+        read_tree.arg("--empty");
+    }
+    git_output(read_tree)?;
+
+    let mut add = Command::new("git");
+    add.current_dir(source)
+        .env("GIT_INDEX_FILE", &index)
+        .arg("add")
+        .arg("--")
+        .args(paths);
+    git_output(add)?;
+
+    let mut diff = Command::new("git");
+    diff.current_dir(source)
+        .env("GIT_INDEX_FILE", &index)
+        .args([
+            "diff",
+            "--cached",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            "--color=never",
+        ]);
+    let output = git_output(diff)?;
+    let preview = String::from_utf8_lossy(&output);
+    let mut lines = preview.lines();
+    let limited = lines.by_ref().take(2500).collect::<Vec<_>>().join("\n");
+    if lines.next().is_some() {
+        Ok(format!("{limited}\n\n[Preview shortened to 2,500 lines.]"))
+    } else {
+        Ok(limited)
+    }
+}
+
+/// Stage and commit only the chosen paths. Already-staged changes in other
+/// files stay in the index for a later commit.
+pub fn commit_git(paths: &[PathBuf], message: &str) -> Result<String, String> {
+    if paths.is_empty() || message.trim().is_empty() {
+        return Err("select files and enter a commit message".into());
+    }
+    let source = git_source()?;
+    commit_from(&source, paths, message)?;
+    Ok("Committed selected files. Continue or Push & Close.".into())
+}
+
+fn commit_from(source: &Path, paths: &[PathBuf], message: &str) -> Result<(), String> {
+    let mut add = Command::new("git");
+    add.current_dir(source).arg("add").arg("--").args(paths);
+    git_output(add)?;
+
+    let mut commit = Command::new("git");
+    commit
+        .current_dir(source)
+        .arg("commit")
+        .arg("--only")
+        .arg("-m")
+        .arg(message.trim())
+        .arg("--")
+        .args(paths);
+    git_output(commit).map(drop)
+}
+
+/// Push existing commits via Git's configured upstream.
+pub fn push_git() -> Result<String, String> {
+    let source = git_source()?;
+    push_from(&source).map(|_| "Push complete.".into())
+}
+
+fn push_from(source: &Path) -> Result<(), String> {
+    let mut cmd = Command::new("git");
+    cmd.current_dir(source).arg("push");
+    git_output(cmd).map(drop)
+}
+
+/// Resolve chezmoi's source directory, not the GUI's working directory. Do
+/// not act on a parent Git repository: that could stage unrelated files.
+fn git_source() -> Result<PathBuf, String> {
+    let raw = run(&["source-path"])?;
+    let raw = raw.trim_end_matches(['\r', '\n']);
+    if raw.is_empty() {
+        return Err("chezmoi returned an empty source directory".into());
+    }
+    let source = PathBuf::from(raw);
+    let source = source
+        .canonicalize()
+        .map_err(|e| format!("could not find chezmoi source directory: {e}"))?;
+    let mut cmd = Command::new("git");
+    cmd.current_dir(&source)
+        .args(["rev-parse", "--show-toplevel"]);
+    let root =
+        PathBuf::from(String::from_utf8_lossy(&git_output(cmd)?).trim_end_matches(['\r', '\n']));
+    if root
+        .canonicalize()
+        .map_err(|e| format!("could not find Git root: {e}"))?
+        != source
+    {
+        return Err("chezmoi source directory is not the Git repository root".into());
+    }
+    Ok(source)
+}
+
+fn git(source: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+    let mut cmd = Command::new("git");
+    cmd.current_dir(source).args(args);
+    git_output(cmd)
+}
+
+fn git_output(mut cmd: Command) -> Result<Vec<u8>, String> {
+    // A background Task cannot answer Git's terminal prompts.
+    let output = cmd
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .map_err(|e| format!("could not run git: {e}"))?;
+    command_result(output)
+}
+
+fn command_result(output: Output) -> Result<Vec<u8>, String> {
+    if output.status.success() {
+        Ok(output.stdout)
+    } else {
+        let error = String::from_utf8_lossy(&output.stderr);
+        let error = error.trim();
+        if error.is_empty() {
+            Err(format!("git exited with {}", output.status))
+        } else {
+            Err(error.into())
+        }
+    }
+}
+
 /// Run a verb that takes an optional list of target paths, with `--force`.
 fn run_targets(verb: &str, targets: &[PathBuf]) -> Result<String, String> {
     let mut args = vec![verb.to_string(), "--force".to_string()];
@@ -207,7 +411,7 @@ fn run_targets(verb: &str, targets: &[PathBuf]) -> Result<String, String> {
 
 /// Invoke `chezmoi` with `args`, returning stdout on success.
 ///
-/// This is the one place a subprocess is actually spawned. A failure to launch
+/// This is the one place a chezmoi subprocess is actually spawned. A failure to launch
 /// the binary at all, or any non-zero exit, becomes an `Err` carrying the most
 /// useful message available (chezmoi writes errors to stderr). `--no-tty`
 /// guarantees chezmoi never tries to grab a terminal we don't have.
@@ -234,4 +438,122 @@ fn run(args: &[&str]) -> Result<String, String> {
 /// `$HOME` as a path, if set. Used only to prettify paths for display.
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_nul_delimited_git_paths() {
+        let entries = parse_git_status(b" M path with spaces\0?? new\nfile\0D  deleted\0");
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].status, " M");
+        assert_eq!(entries[0].path, Path::new("path with spaces"));
+        assert_eq!(entries[1].display, "new\\nfile");
+        assert_eq!(entries[2].path, Path::new("deleted"));
+    }
+
+    #[test]
+    fn previews_and_commits_selected_paths_then_pushes_separately() {
+        let dir = std::env::temp_dir().join(format!(
+            "chezmui-git-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let source = dir.join("source");
+        let remote = dir.join("remote.git");
+        std::fs::create_dir_all(&source).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q", "--bare"])
+                .arg(&remote)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["init", "-q", "--initial-branch=main"])
+                .arg(&source)
+                .status()
+                .unwrap()
+                .success()
+        );
+        for args in [
+            vec!["config", "user.name", "Test"],
+            vec!["config", "user.email", "test@example.org"],
+            vec!["remote", "add", "origin", remote.to_str().unwrap()],
+        ] {
+            git(&source, &args).unwrap();
+        }
+        std::fs::write(source.join("chosen"), "base").unwrap();
+        std::fs::write(source.join("other"), "base").unwrap();
+        let initial = preview_from(&source, &[PathBuf::from("chosen")]).unwrap();
+        assert!(initial.contains("+base"));
+        assert!(!initial.contains("other"));
+        assert!(
+            git(&source, &["diff", "--cached", "--name-only"])
+                .unwrap()
+                .is_empty()
+        );
+        git(&source, &["add", "."]).unwrap();
+        git(&source, &["commit", "-m", "base"]).unwrap();
+        git(&source, &["push", "-u", "origin", "main"]).unwrap();
+
+        std::fs::write(source.join("chosen"), "selected").unwrap();
+        std::fs::write(source.join("other"), "staged but not selected").unwrap();
+        git(&source, &["add", "other"]).unwrap();
+        let preview = preview_from(&source, &[PathBuf::from("chosen")]).unwrap();
+        assert!(preview.contains("+selected"));
+        assert!(!preview.contains("staged but not selected"));
+        assert_eq!(
+            git(&source, &["diff", "--cached", "--name-only"]).unwrap(),
+            b"other\n"
+        );
+        commit_from(&source, &[PathBuf::from("chosen")], "selected").unwrap();
+        assert_eq!(
+            git(&source, &["show", "--format=", "--name-only", "HEAD"]).unwrap(),
+            b"chosen\n"
+        );
+        assert_eq!(
+            git(&source, &["diff", "--cached", "--name-only"]).unwrap(),
+            b"other\n"
+        );
+        // The remote is unchanged until the user pushes.
+        assert_eq!(
+            git(&remote, &["log", "-1", "--format=%s"]).unwrap(),
+            b"base\n"
+        );
+
+        std::fs::write(source.join("new file"), "new").unwrap();
+        let preview = preview_from(&source, &[PathBuf::from("new file")]).unwrap();
+        assert!(preview.contains("+new"));
+        assert!(!preview.contains("staged but not selected"));
+        commit_from(&source, &[PathBuf::from("new file")], "new file").unwrap();
+        assert_eq!(
+            git(&source, &["log", "-1", "--format=%s"]).unwrap(),
+            b"new file\n"
+        );
+        assert_eq!(
+            git(&remote, &["log", "-1", "--format=%s"]).unwrap(),
+            b"base\n"
+        );
+        push_from(&source).unwrap();
+        assert_eq!(
+            git(&remote, &["log", "-1", "--format=%s"]).unwrap(),
+            b"new file\n"
+        );
+
+        git(&source, &["remote", "remove", "origin"]).unwrap();
+        assert!(push_from(&source).is_err());
+        assert_eq!(
+            git(&source, &["log", "-1", "--format=%s"]).unwrap(),
+            b"new file\n"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

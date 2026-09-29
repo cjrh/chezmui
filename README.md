@@ -22,12 +22,23 @@ explicitly so you never have to keep them straight:
 - **← Re-add** — save your file's current contents back into chezmoi (home → source).
 - **Forget** — stop managing a file. Your real file is left untouched.
 
-The global actions across the top operate on everything at once:
+The top-left actions work with local files:
 
 - **Refresh** — re-read the status.
-- **Apply all →** — push every managed change onto your home directory.
-- **Update (pull)** — `chezmoi update`: pull from the remote and apply.
+- **Apply all →** — write every managed source change onto your home files.
 - **Add files…** — open a native file picker to start managing new files.
+
+The amber **Remote / Git** actions are on the right:
+
+- **Update (pull)** — `chezmoi update`: pull from the remote **and apply to home**.
+- **Commit & push…** — open a separate Git window for chezmoi's source
+  repository. Select files to see the exact diff for the next commit, enter a
+  message, then use **Commit**. Make more commits in the same window, then use
+  **Push & Close** to push existing commits. It does not commit selected files.
+  Only selected files go into each commit, even if other files are staged.
+  A failed push leaves the window open for a retry. Git errors are shown there.
+  iced cannot parent this second window as a native modal on Linux; the main
+  window remains visible, but its actions are disabled until you close Git.
 
 Diffs are syntax-coloured the way a terminal pager would render them: additions in
 green, removals in red, hunk headers in the accent colour.
@@ -35,8 +46,9 @@ green, removals in red, hunk headers in the accent colour.
 ## Requirements
 
 - The [`chezmoi`](https://www.chezmoi.io/install/) CLI, installed and on your `PATH`.
-  chezmui never touches your dotfiles directly — every operation shells out to
-  `chezmoi`, so it respects your existing chezmoi setup.
+  chezmui uses it for dotfile operations and to locate its source directory.
+- Git, installed and on your `PATH`, and a Git repository at the root of the
+  chezmoi source directory. Commit and push use your existing Git configuration.
 - A Rust toolchain supporting **edition 2024** (Rust 1.85 or newer) to build.
 - The sibling [`iced-themer`](../iced-themer) crate, expected at `../iced-themer`
   relative to this repository (it is referenced as a local path dependency).

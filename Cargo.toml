@@ -18,3 +18,4 @@ iced = { version = "0.14", default-features = false, features = [
 ] }
 iced-themer = { path = "../iced-themer" }
 rfd = "0.17"
+tempfile = "3"
