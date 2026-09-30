@@ -43,17 +43,41 @@ The amber **Remote / Git** actions are on the right:
 Diffs are syntax-coloured the way a terminal pager would render them: additions in
 green, removals in red, hunk headers in the accent colour.
 
+## Install on Linux
+
+Download the x86_64 AppImage and `.sha256` file from
+[GitHub Releases](https://github.com/cjrh/chezmui/releases). Then run:
+
+```sh
+# Replace VERSION with the release version, for example 0.1.1.
+sha256sum --check --ignore-missing chezmui-vVERSION-x86_64.sha256
+chmod +x chezmui-vVERSION-x86_64.AppImage
+./chezmui-vVERSION-x86_64.AppImage
+```
+
+If FUSE is unavailable, use
+`./chezmui-vVERSION-x86_64.AppImage --appimage-extract-and-run`.
+A `.tar.gz` archive with the binary is also available.
+
+Release builds use Ubuntu 22.04 and require glibc 2.35 or newer. Use a Linux
+desktop with Wayland or X11, system fonts, and XKB keyboard data. Native file
+pickers need `xdg-desktop-portal` and a portal backend for your desktop.
+The AppImage includes the keyboard and Wayland client libraries, but not
+chezmoi or Git. No Rust toolchain or sibling checkout is needed to run it.
+
 ## Requirements
 
 - The [`chezmoi`](https://www.chezmoi.io/install/) CLI, installed and on your `PATH`.
   chezmui uses it for dotfile operations and to locate its source directory.
 - Git, installed and on your `PATH`, and a Git repository at the root of the
   chezmoi source directory. Commit and push use your existing Git configuration.
-- A Rust toolchain supporting **edition 2024** (Rust 1.85 or newer) to build.
-- The sibling [`iced-themer`](../iced-themer) crate, expected at `../iced-themer`
-  relative to this repository (it is referenced as a local path dependency).
 
 ## Building and running
+
+To build from source, install the stable Rust toolchain and check out
+[`iced-themer`](https://github.com/cjrh/iced-themer) at `../iced-themer`.
+It is a local path dependency. The release workflow pins its commit so CI does
+not depend on later changes to that repository.
 
 ```sh
 cargo run --release
@@ -84,6 +108,62 @@ no matter which directory you launch it from.
 Colours, fonts, and panel styling come from [`theme.toml`](theme.toml), which is
 consumed by the `iced-themer` crate and embedded at build time. Edit the
 `[variables]` and `[palette]` sections to recolour the app, then rebuild.
+
+## Releases
+
+Install [cargo-release](https://github.com/crate-ci/cargo-release) once:
+
+```sh
+cargo install cargo-release --locked
+```
+
+Commit the release setup before the first release. From a clean `main` branch:
+
+```sh
+cargo test --locked
+cargo release patch            # Preview; no changes, tag, or push.
+cargo release patch --execute  # Bump, commit, tag vX.Y.Z, and push to origin.
+```
+
+Use `minor` or `major` instead of `patch` when needed. `publish = false` prevents
+crates.io publication. `release.toml` enables Git tags and pushes independently.
+
+A pushed version tag starts [the release workflow](.github/workflows/release.yml).
+It checks that the tag matches `Cargo.toml`, runs tests, and builds:
+
+- `chezmui-vX.Y.Z-x86_64.AppImage`
+- `chezmui-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz`
+- `chezmui-vX.Y.Z-x86_64.sha256`
+
+Only a successful build can publish the GitHub release. Release notes are
+created from GitHub history. Tags with a prerelease suffix produce prereleases.
+A retry replaces assets on the same release. The workflow uses the built-in
+`GITHUB_TOKEN`; no extra release secret is needed.
+
+Use **Actions → Release → Run workflow** to check the build without publishing.
+Download its `linux-x86_64` artifact to inspect the files. GitHub's workflow
+artifact ZIP does not preserve executable permissions; run `chmod +x` on its
+AppImage after extraction.
+
+### Build release artifacts locally
+
+Install `linuxdeploy` on `PATH`. The script uses system `patchelf` instead of
+linuxdeploy's bundled copy, which can damage newer shared libraries.
+On Ubuntu, also install:
+
+```sh
+sudo apt-get install python3 pkg-config patchelf libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev
+./build-appimage.sh
+```
+
+The script writes all three files to `target/dist/` (or `$CARGO_TARGET_DIR/dist/`).
+The workflow records the tested linuxdeploy version and checksum. Build on
+Ubuntu 22.04 for the same glibc baseline; an AppImage built on a newer system
+can require a newer glibc.
+
+When changing `iced-themer`, update its commit in the workflow and verify
+`cargo test --locked` with that clean checkout. Local uncommitted sibling
+changes are not part of a release build.
 
 ## Status
 

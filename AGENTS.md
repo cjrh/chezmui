@@ -2,7 +2,8 @@
 
 A small desktop GUI front-end for the [chezmoi](https://www.chezmoi.io/) dotfile
 manager. It shows the diff between your source and destination state and lets you
-apply or re-add changes with one click. Personal binary, never published.
+apply or re-add changes with one click. Personal binary, never published to
+crates.io. GitHub Releases provide Linux x86_64 builds.
 
 ## Layout
 
@@ -19,6 +20,13 @@ apply or re-add changes with one click. Personal binary, never published.
 - The iced `tiny-skia` **CPU renderer is deliberate** (see `Cargo.toml`): it
   avoids GPU context loss across suspend/resume on Linux. Don't switch to wgpu.
 - Theme/colours come from `theme.toml` via iced-themer.
+- `release.toml` configures cargo-release: bump, commit, tag `vX.Y.Z`, and push
+  from `main`. Do not execute a release unless the user asks.
+- `.github/workflows/release.yml` builds Linux x86_64 artifacts on tag pushes.
+  It checks out a pinned `iced-themer` commit as a sibling. Keep that pin in sync
+  with tested dependency changes; do not use a moving branch in release builds.
+- `build-appimage.sh` creates the AppImage, binary archive, and checksums in
+  `target/dist/`. Desktop assets are in `packaging/`.
 
 ## iced gotchas (re-derived more than once — don't repeat the investigation)
 

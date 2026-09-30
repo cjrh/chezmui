@@ -1,0 +1,11 @@
+# From a clean main branch:
+#   cargo release patch            # preview only
+#   cargo release patch --execute  # bump, commit, tag, and push
+# The pushed tag starts .github/workflows/release.yml.
+allow-branch = ["main"]
+publish = false
+push-remote = "origin"
+push = true
+tag = true
+tag-name = "v{{version}}"
+pre-release-commit-message = "chore: release v{{version}}"

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=chezmui
+Comment=Review and sync your chezmoi dotfiles
+Exec=chezmui
+Icon=chezmui
+Terminal=false
+Categories=Utility;
+# Must match application_id in src/main.rs.
+StartupWMClass=chezmui
