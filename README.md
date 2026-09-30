@@ -169,3 +169,8 @@ changes are not part of a release build.
 
 A personal tool. It is not published to crates.io and carries no stability
 guarantees.
+
+## Licence
+
+Licensed under the GNU Affero General Public License, version 3 or (at your
+option) any later version (`AGPL-3.0-or-later`). See [LICENSE](LICENSE).

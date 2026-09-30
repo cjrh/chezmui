@@ -24,6 +24,8 @@ mkdir -p "$dist"
 work=$(mktemp -d "$target_dir/appimage.XXXXXX")
 trap 'rm -rf -- "$work"' EXIT
 appdir="$work/chezmui.AppDir"
+mkdir -p "$appdir/usr/share/licenses/chezmui"
+install -m 644 LICENSE "$appdir/usr/share/licenses/chezmui/LICENSE"
 
 cargo build --release --locked --target "$target"
 binary="$target_dir/$target/release/chezmui"
@@ -73,7 +75,7 @@ chmod +x "$work/$name.AppImage"
 archive="chezmui-v${version}-${target}"
 mkdir -p "$work/$archive"
 install -m 755 "$binary" "$work/$archive/chezmui"
-install -m 644 README.md "$work/$archive/README.md"
+install -m 644 README.md LICENSE "$work/$archive/"
 tar -C "$work" -czf "$work/$archive.tar.gz" "$archive"
 (
     cd "$work"
