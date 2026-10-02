@@ -469,7 +469,7 @@ mod tests {
         std::fs::create_dir_all(&source).unwrap();
         assert!(
             Command::new("git")
-                .args(["init", "-q", "--bare"])
+                .args(["init", "-q", "--bare", "--initial-branch=main"])
                 .arg(&remote)
                 .status()
                 .unwrap()
